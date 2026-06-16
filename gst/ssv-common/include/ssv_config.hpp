@@ -28,8 +28,11 @@ struct SsvConfig {
     // Inference
     std::string model_path;
     float confidence_threshold = 0.5f;
-    std::string device = "cpu";
+    std::string device = "auto";
+    int cuda_device_id = 0;
+    bool cuda_required = false;
     std::string target_class = "person";
+    std::string label_map = "config/model-labels/coco80.txt";
 
     // Tracking
     bool tracking_enabled = true;

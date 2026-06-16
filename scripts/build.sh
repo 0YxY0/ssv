@@ -15,13 +15,21 @@ ssv_info "等待构建锁..."
 flock 9
 
 ensure_onnxruntime() {
-    if pkg-config --exists onnxruntime; then
+    local version="${SSV_ONNXRUNTIME_VERSION:-1.25.1}"
+    local flavor="${SSV_ONNXRUNTIME_FLAVOR:-cpu}"
+    local default_root="$SSV_ROOT/.deps/onnxruntime"
+    if [ "$flavor" = "gpu" ]; then
+        default_root="$SSV_ROOT/.deps/onnxruntime-gpu"
+    elif [ "$flavor" != "cpu" ]; then
+        ssv_error "unsupported SSV_ONNXRUNTIME_FLAVOR: $flavor (expected cpu or gpu)"
+        return 1
+    fi
+    local root="${SSV_ONNXRUNTIME_ROOT:-$default_root}"
+    local pc_file="$root/lib/pkgconfig/onnxruntime.pc"
+
+    if [ "$flavor" = "cpu" ] && pkg-config --exists onnxruntime; then
         return 0
     fi
-
-    local version="${SSV_ONNXRUNTIME_VERSION:-1.25.1}"
-    local root="${SSV_ONNXRUNTIME_ROOT:-$SSV_ROOT/.deps/onnxruntime}"
-    local pc_file="$root/lib/pkgconfig/onnxruntime.pc"
 
     if [ -f "$pc_file" ]; then
         export PKG_CONFIG_PATH="$root/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
@@ -39,9 +47,14 @@ ensure_onnxruntime() {
             ;;
     esac
 
-    local archive="onnxruntime-linux-${arch}-${version}.tgz"
+    local archive
+    if [ "$flavor" = "gpu" ]; then
+        archive="onnxruntime-linux-${arch}-gpu-${version}.tgz"
+    else
+        archive="onnxruntime-linux-${arch}-${version}.tgz"
+    fi
     local url="https://github.com/microsoft/onnxruntime/releases/download/v${version}/${archive}"
-    local tmp_dir="$SSV_ROOT/.deps/tmp/onnxruntime-${version}"
+    local tmp_dir="$SSV_ROOT/.deps/tmp/onnxruntime-${flavor}-${version}"
 
     ssv_info "ONNX Runtime not found; downloading ${archive}"
     rm -rf "$tmp_dir"
@@ -58,7 +71,11 @@ ensure_onnxruntime() {
 
     tar -xzf "$tmp_dir/$archive" -C "$tmp_dir"
     rm -rf "$root"
-    mv "$tmp_dir/onnxruntime-linux-${arch}-${version}" "$root"
+    if [ "$flavor" = "gpu" ]; then
+        mv "$tmp_dir/onnxruntime-linux-${arch}-gpu-${version}" "$root"
+    else
+        mv "$tmp_dir/onnxruntime-linux-${arch}-${version}" "$root"
+    fi
     rm -rf "$tmp_dir"
 
     mkdir -p "$root/lib/pkgconfig"

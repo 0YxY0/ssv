@@ -7,11 +7,13 @@ gst_unit_tests = executable('gst-unit-tests',
 
 test('gst-unit-tests', gst_unit_tests,
   env : {
+    'GST_REGISTRY' : meson.project_build_root() / 'gst-test-registry.bin',
     'GST_PLUGIN_PATH' : meson.project_build_root() / 'gst' / 'ssv-template'
       + ':' + meson.project_build_root() / 'gst' / 'ssv-infer'
       + ':' + meson.project_build_root() / 'gst' / 'ssv-track'
       + ':' + meson.project_build_root() / 'gst' / 'ssv-pub'
       + ':' + meson.project_build_root() / 'gst' / 'ssv-overlay',
-    'LD_LIBRARY_PATH' : meson.project_build_root() / 'gst' / 'ssv-common',
+    'LD_LIBRARY_PATH' : meson.project_build_root() / 'gst' / 'ssv-common'
+      + ':' + meson.project_source_root() / '.deps' / 'onnxruntime' / 'lib',
   },
 )

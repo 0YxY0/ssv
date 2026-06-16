@@ -9,7 +9,7 @@ source "$(dirname "$0")/lib.sh"
 cd "$SSV_ROOT"
 
 MODE="run"
-DISPLAY=false
+SHOW_DISPLAY=false
 DISPLAY_OVERLAY="${SSV_DISPLAY_OVERLAY:-false}"
 DISPLAY_SINK_OVERRIDE=""
 SKIP_BUILD=false
@@ -37,11 +37,11 @@ esac
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --display)
-            DISPLAY=true
+            SHOW_DISPLAY=true
             shift
             ;;
         --overlay)
-            DISPLAY=true
+            SHOW_DISPLAY=true
             DISPLAY_OVERLAY=true
             shift
             ;;
@@ -50,7 +50,7 @@ while [ "$#" -gt 0 ]; do
                 ssv_error "--sink requires a sink name"
                 exit 1
             fi
-            DISPLAY=true
+            SHOW_DISPLAY=true
             DISPLAY_SINK_OVERRIDE="$2"
             shift 2
             ;;
@@ -91,9 +91,17 @@ if [ -z "$RTSP_URL" ]; then
 fi
 
 MODEL="${SSV_MODEL_PATH:-models/yolov8n.onnx}"
+TARGET_CLASS="${SSV_TARGET_CLASS-person}"
+LABEL_MAP="${SSV_LABEL_MAP:-config/model-labels/coco80.txt}"
 if [ ! -f "$MODEL" ]; then
     ssv_error "模型文件不存在: $MODEL"
     ssv_warn "运行 ./ssv download-model 下载模型，或设置 SSV_MODEL_PATH"
+    exit 1
+fi
+
+if [ -n "$LABEL_MAP" ] && [ ! -f "$LABEL_MAP" ]; then
+    ssv_error "类别表文件不存在: $LABEL_MAP"
+    ssv_warn "设置 SSV_LABEL_MAP，或使用默认 config/model-labels/coco80.txt"
     exit 1
 fi
 
@@ -108,6 +116,9 @@ FRAME_HEIGHT="${SSV_FRAME_HEIGHT:-480}"
 DISPLAY_FPS="${SSV_DISPLAY_FPS:-30}"
 ANALYSIS_FPS="${SSV_ANALYSIS_FPS:-5}"
 CONF_THRESHOLD="${SSV_CONF_THRESHOLD:-0.5}"
+INFER_DEVICE="${SSV_INFER_DEVICE:-auto}"
+CUDA_DEVICE_ID="${SSV_CUDA_DEVICE_ID:-0}"
+CUDA_REQUIRED="${SSV_CUDA_REQUIRED:-false}"
 RTSP_PROTOCOLS="${SSV_RTSP_PROTOCOLS:-tcp}"
 RTSP_LATENCY="${SSV_RTSP_LATENCY:-200}"
 REDIS_HOST="${REDIS_HOST:-localhost}"
@@ -126,8 +137,23 @@ resolve_display_sink() {
         return 0
     fi
 
+    if [ -n "${DISPLAY:-}" ] && gst-inspect-1.0 gtksink >/dev/null 2>&1; then
+        echo "gtksink"
+        return 0
+    fi
+
     if [ -n "${WAYLAND_DISPLAY:-}" ] && gst-inspect-1.0 waylandsink >/dev/null 2>&1; then
         echo "waylandsink"
+        return 0
+    fi
+
+    if [ -n "${DISPLAY:-}" ] && gst-inspect-1.0 ximagesink >/dev/null 2>&1; then
+        echo "ximagesink"
+        return 0
+    fi
+
+    if [ -n "${DISPLAY:-}" ] && gst-inspect-1.0 xvimagesink >/dev/null 2>&1; then
+        echo "xvimagesink"
         return 0
     fi
 
@@ -146,6 +172,10 @@ resolve_display_sink() {
 }
 
 DISPLAY_SINK="$(resolve_display_sink)"
+display_sink_args=("$DISPLAY_SINK")
+if [ "$DISPLAY_SINK" != "gtksink" ]; then
+    display_sink_args+=("sync=false")
+fi
 
 rtsp_decode_pipeline=(
     rtspsrc "location=$RTSP_URL" "protocols=$RTSP_PROTOCOLS" "latency=$RTSP_LATENCY"
@@ -155,12 +185,26 @@ rtsp_decode_pipeline=(
     ! videoconvert
 )
 
+infer_props=(
+    ssvinfer
+    "model-path=$MODEL"
+    "conf-threshold=$CONF_THRESHOLD"
+    "label-map=$LABEL_MAP"
+    "device=$INFER_DEVICE"
+    "cuda-device-id=$CUDA_DEVICE_ID"
+    "cuda-required=$CUDA_REQUIRED"
+    "async=true"
+)
+if [ -n "$TARGET_CLASS" ]; then
+    infer_props+=("target-class=$TARGET_CLASS")
+fi
+
 analysis_pipeline=(
     ! videoscale
     ! videorate
     ! "video/x-raw,width=$FRAME_WIDTH,height=$FRAME_HEIGHT,framerate=$ANALYSIS_FPS/1,format=BGR"
     ! ssvtemplate
-    ! ssvinfer "model-path=$MODEL" "conf-threshold=$CONF_THRESHOLD" "async=true"
+    ! "${infer_props[@]}"
     ! ssvtrack
     ! ssvpub "redis-host=$REDIS_HOST" "redis-port=$REDIS_PORT" "stream-key=$REDIS_STREAM_KEY"
 )
@@ -175,9 +219,12 @@ ssv_info "输入: $RTSP_URL"
 ssv_info "RTSP transport: $RTSP_PROTOCOLS, latency: ${RTSP_LATENCY}ms"
 ssv_info "显示帧率: ${DISPLAY_FPS}fps, 分析帧率: ${ANALYSIS_FPS}fps"
 ssv_info "模型: $MODEL"
+ssv_info "推理设备: $INFER_DEVICE (cuda-device-id=$CUDA_DEVICE_ID, cuda-required=$CUDA_REQUIRED)"
+ssv_info "目标类别: ${TARGET_CLASS:-全部类别}"
+ssv_info "类别表: ${LABEL_MAP:-内置 COCO}"
 ssv_info "Redis Stream: $REDIS_STREAM_KEY"
 
-if [ "$DISPLAY" = true ]; then
+if [ "$SHOW_DISPLAY" = true ]; then
     ssv_info "模式: 实时链路 + 视频观察窗口 (sink: $DISPLAY_SINK)"
     ssv_info "关闭视频窗口即退出"
     if [ "$DISPLAY_OVERLAY" = true ]; then
@@ -188,10 +235,10 @@ if [ "$DISPLAY" = true ]; then
             ! tee name=t \
               t. ! queue "leaky=downstream" "max-size-buffers=2" \
                  "${display_source_pipeline[@]}" \
-                 ! videoconvert ! "video/x-raw,format=BGRx" ! ssvoverlay ! videoconvert ! "$DISPLAY_SINK" sync=false \
+                 ! videoconvert ! "video/x-raw,format=BGRx" ! ssvoverlay ! videoconvert ! "video/x-raw,format=BGRx" ! "${display_sink_args[@]}" \
               t. ! queue "leaky=downstream" "max-size-buffers=2" \
                  "${analysis_pipeline[@]}" \
-                 ! fakesink sync=false
+                 ! fakesink sync=false async=false
     else
         GST_DEBUG="${GST_DEBUG:-ssv*:4}" \
         gst-launch-1.0 \
@@ -199,10 +246,10 @@ if [ "$DISPLAY" = true ]; then
             ! tee name=t \
               t. ! queue "leaky=downstream" "max-size-buffers=2" \
                  "${display_source_pipeline[@]}" \
-                 ! videoconvert ! "$DISPLAY_SINK" sync=false \
+                 ! videoconvert ! "video/x-raw,format=BGRx" ! "${display_sink_args[@]}" \
               t. ! queue "leaky=downstream" "max-size-buffers=2" \
                  "${analysis_pipeline[@]}" \
-                 ! fakesink sync=false
+                 ! fakesink sync=false async=false
     fi
 else
     if [ "$MODE" = "smoke" ]; then

@@ -84,7 +84,10 @@ SsvConfig ssv_config_load(const std::string& path) {
         cfg.model_path = get_or<std::string>(inference, "model_path", cfg.model_path);
         cfg.confidence_threshold = get_or<float>(inference, "confidence_threshold", cfg.confidence_threshold);
         cfg.device = get_or<std::string>(inference, "device", cfg.device);
+        cfg.cuda_device_id = get_or<int>(inference, "cuda_device_id", cfg.cuda_device_id);
+        cfg.cuda_required = get_or<bool>(inference, "cuda_required", cfg.cuda_required);
         cfg.target_class = get_or<std::string>(inference, "target_class", cfg.target_class);
+        cfg.label_map = get_or<std::string>(inference, "label_map", cfg.label_map);
     }
 
     // Tracking

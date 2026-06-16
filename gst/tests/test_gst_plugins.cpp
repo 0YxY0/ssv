@@ -6,6 +6,7 @@
 #include <gst/video/video.h>
 
 #include <cstring>
+#include <string>
 
 extern void run_ssv_meta_tests();
 
@@ -21,6 +22,65 @@ GST_START_TEST(test_ssv_plugin_factories_are_registered) {
     assert_element_factory("ssvtrack");
     assert_element_factory("ssvpub");
     assert_element_factory("ssvoverlay");
+}
+GST_END_TEST
+
+GST_START_TEST(test_ssvinfer_exposes_label_map_property) {
+    GstElement *element = gst_element_factory_make("ssvinfer", nullptr);
+    fail_unless(element != nullptr);
+
+    gchar *target_class = nullptr;
+    g_object_get(element, "target-class", &target_class, nullptr);
+    fail_unless(target_class != nullptr);
+    fail_unless(std::string(target_class).empty());
+    g_free(target_class);
+
+    g_object_set(element, "label-map", "config/model-labels/coco80.txt", nullptr);
+    gchar *label_map = nullptr;
+    g_object_get(element, "label-map", &label_map, nullptr);
+    fail_unless(label_map != nullptr);
+    fail_unless(std::string(label_map) == "config/model-labels/coco80.txt");
+
+    g_free(label_map);
+    gst_object_unref(element);
+}
+GST_END_TEST
+
+GST_START_TEST(test_ssvinfer_exposes_device_properties) {
+    GstElement *element = gst_element_factory_make("ssvinfer", nullptr);
+    fail_unless(element != nullptr);
+
+    gchar *device = nullptr;
+    gboolean cuda_required = TRUE;
+    gint cuda_device_id = -1;
+    g_object_get(element,
+        "device", &device,
+        "cuda-device-id", &cuda_device_id,
+        "cuda-required", &cuda_required,
+        nullptr);
+    fail_unless(device != nullptr);
+    fail_unless(std::string(device) == "auto");
+    fail_unless(cuda_device_id == 0);
+    fail_unless(cuda_required == FALSE);
+    g_free(device);
+
+    g_object_set(element,
+        "device", "cuda",
+        "cuda-device-id", 1,
+        "cuda-required", TRUE,
+        nullptr);
+    g_object_get(element,
+        "device", &device,
+        "cuda-device-id", &cuda_device_id,
+        "cuda-required", &cuda_required,
+        nullptr);
+    fail_unless(device != nullptr);
+    fail_unless(std::string(device) == "cuda");
+    fail_unless(cuda_device_id == 1);
+    fail_unless(cuda_required == TRUE);
+
+    g_free(device);
+    gst_object_unref(element);
 }
 GST_END_TEST
 
@@ -127,6 +187,8 @@ static Suite *ssv_gst_suite() {
     Suite *suite = suite_create("ssv-gst");
     TCase *tc = tcase_create("plugins");
     tcase_add_test(tc, test_ssv_plugin_factories_are_registered);
+    tcase_add_test(tc, test_ssvinfer_exposes_label_map_property);
+    tcase_add_test(tc, test_ssvinfer_exposes_device_properties);
     tcase_add_test(tc, test_ssvoverlay_runs_on_rgb_buffer);
     tcase_add_test(tc, test_ssvoverlay_runs_on_bgrx_buffer);
     tcase_add_test(tc, test_ssvoverlay_draws_latest_detection);

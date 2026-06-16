@@ -6,8 +6,11 @@
 #include <onnxruntime_cxx_api.h>
 
 #include <algorithm>
+#include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <new>
 #include <string>
@@ -50,6 +53,12 @@ struct _SsvInfer {
     gchar *model_path;
     gfloat conf_threshold;
     gchar *target_class;
+    gchar *label_map_path;
+    gchar *device;
+    gint cuda_device_id;
+    gboolean cuda_required;
+    std::vector<std::string> *label_names;
+    int target_class_id;
 
     Ort::Env *ort_env;
     Ort::Session *ort_session;
@@ -61,6 +70,7 @@ struct _SsvInfer {
     std::string *output_name;
     int num_classes;
     bool is_yolov8;
+    bool is_yolo_nx6;
 
     guint64 frame_id;
     gboolean mock_detect;
@@ -79,6 +89,10 @@ enum {
     PROP_MODEL_PATH,
     PROP_CONF_THRESHOLD,
     PROP_TARGET_CLASS,
+    PROP_LABEL_MAP,
+    PROP_DEVICE,
+    PROP_CUDA_DEVICE_ID,
+    PROP_CUDA_REQUIRED,
     PROP_MOCK_DETECT,
     PROP_ASYNC_INFER,
 };
@@ -137,15 +151,75 @@ preprocess_bgr_to_chw(const uint8_t *src, int src_w, int src_h, int src_stride,
     }
 }
 
+static std::vector<std::string>
+default_coco_labels()
+{
+    return std::vector<std::string>(COCO_NAMES, COCO_NAMES + NUM_COCO_CLASSES);
+}
+
+static std::string
+trim_label_line(const std::string &line)
+{
+    const char *spaces = " \t\r\n";
+    size_t begin = line.find_first_not_of(spaces);
+    if (begin == std::string::npos)
+        return "";
+    size_t end = line.find_last_not_of(spaces);
+    return line.substr(begin, end - begin + 1);
+}
+
+static bool
+load_label_map_file(const char *path, std::vector<std::string> *labels, std::string *error)
+{
+    std::ifstream input(path);
+    if (!input) {
+        *error = std::string("label-map not found: ") + path;
+        return false;
+    }
+
+    std::string line;
+    while (std::getline(input, line)) {
+        std::string value = trim_label_line(line);
+        if (value.empty() || value[0] == '#')
+            continue;
+        labels->push_back(value);
+    }
+
+    if (labels->empty()) {
+        *error = std::string("label-map has no labels: ") + path;
+        return false;
+    }
+    return true;
+}
+
+static bool
+str_equal(const char *left, const char *right)
+{
+    return left && right && std::strcmp(left, right) == 0;
+}
+
+static bool
+use_cuda_requested(const char *device)
+{
+    return str_equal(device, "auto") || str_equal(device, "cuda");
+}
+
+static bool
+use_cpu_only(const char *device)
+{
+    return str_equal(device, "cpu");
+}
+
 static int
-target_class_to_index(const char *target_class) {
+label_to_index(const std::vector<std::string> &labels, const char *target_class)
+{
     if (!target_class || target_class[0] == '\0')
         return -1;
-    for (int i = 0; i < NUM_COCO_CLASSES; ++i) {
-        if (std::strcmp(target_class, COCO_NAMES[i]) == 0)
-            return i;
+    for (size_t i = 0; i < labels.size(); ++i) {
+        if (labels[i] == target_class)
+            return (int)i;
     }
-    return -1;
+    return -2;
 }
 
 static float
@@ -192,9 +266,68 @@ apply_nms(std::vector<SsvDetection> &detections, float iou_threshold, size_t max
 }
 
 static void
+parse_yolo_nx6(const float *data, int n_detections,
+               int input_w, int input_h, int source_w, int source_h,
+               float conf_thr, int target_cls_idx,
+               const std::vector<std::string> &labels,
+               SsvFrameDetections *out)
+{
+    float letterbox_scale = std::min((float)input_w / source_w, (float)input_h / source_h);
+    float content_w = source_w * letterbox_scale;
+    float content_h = source_h * letterbox_scale;
+    float pad_x = (input_w - content_w) * 0.5f;
+    float pad_y = (input_h - content_h) * 0.5f;
+
+    for (int i = 0; i < n_detections; ++i) {
+        const float *row = data + i * 6;
+        float x1 = row[0];
+        float y1 = row[1];
+        float x2 = row[2];
+        float y2 = row[3];
+        float score = row[4];
+        int cls = (int)std::round(row[5]);
+
+        if (score < conf_thr)
+            continue;
+        if (target_cls_idx >= 0 && cls != target_cls_idx)
+            continue;
+
+        bool pixel_coords = x1 > 1.5f || y1 > 1.5f || x2 > 1.5f || y2 > 1.5f;
+
+        SsvDetection det{};
+        if (pixel_coords) {
+            det.x1 = (x1 - pad_x) / content_w;
+            det.y1 = (y1 - pad_y) / content_h;
+            det.x2 = (x2 - pad_x) / content_w;
+            det.y2 = (y2 - pad_y) / content_h;
+        } else {
+            det.x1 = x1;
+            det.y1 = y1;
+            det.x2 = x2;
+            det.y2 = y2;
+        }
+        det.x1 = std::clamp(det.x1, 0.0f, 1.0f);
+        det.y1 = std::clamp(det.y1, 0.0f, 1.0f);
+        det.x2 = std::clamp(det.x2, 0.0f, 1.0f);
+        det.y2 = std::clamp(det.y2, 0.0f, 1.0f);
+        if (det.x2 <= det.x1 || det.y2 <= det.y1)
+            continue;
+
+        det.confidence = score;
+        det.class_id = cls;
+        if (cls >= 0 && cls < (int)labels.size())
+            std::snprintf(det.class_name, sizeof(det.class_name), "%s", labels[cls].c_str());
+        else
+            std::snprintf(det.class_name, sizeof(det.class_name), "class_%d", cls);
+        out->detections.push_back(det);
+    }
+}
+
+static void
 parse_yolov8(const float *data, int n_anchors, int num_classes,
              int input_w, int input_h, int source_w, int source_h,
              float conf_thr, int target_cls_idx,
+             const std::vector<std::string> &labels,
              SsvFrameDetections *out)
 {
     float letterbox_scale = std::min((float)input_w / source_w, (float)input_h / source_h);
@@ -246,8 +379,8 @@ parse_yolov8(const float *data, int n_anchors, int num_classes,
             continue;
         det.confidence = best_score;
         det.class_id = best_cls;
-        if (best_cls >= 0 && best_cls < NUM_COCO_CLASSES)
-            std::snprintf(det.class_name, sizeof(det.class_name), "%s", COCO_NAMES[best_cls]);
+        if (best_cls >= 0 && best_cls < (int)labels.size())
+            std::snprintf(det.class_name, sizeof(det.class_name), "%s", labels[best_cls].c_str());
         else
             std::snprintf(det.class_name, sizeof(det.class_name), "class_%d", best_cls);
         out->detections.push_back(det);
@@ -298,10 +431,14 @@ ssv_infer_run_on_frame(SsvInfer *self, const SsvInferFrame &input) {
 
     if (self->is_yolov8 && out_shape.size() == 3) {
         int n_anchors = (int)out_shape[2];
-        int target_cls_idx = target_class_to_index(self->target_class);
         parse_yolov8(out_data, n_anchors, self->num_classes,
                      self->model_w, self->model_h, input.width, input.height,
-                     self->conf_threshold, target_cls_idx, &det);
+                     self->conf_threshold, self->target_class_id, *self->label_names, &det);
+    } else if (self->is_yolo_nx6 && out_shape.size() == 3) {
+        int n_detections = (int)out_shape[1];
+        parse_yolo_nx6(out_data, n_detections,
+                       self->model_w, self->model_h, input.width, input.height,
+                       self->conf_threshold, self->target_class_id, *self->label_names, &det);
     }
 
     if (!det.detections.empty()) {
@@ -355,11 +492,58 @@ ssv_infer_start(GstBaseTransform *trans) {
         return FALSE;
     }
 
+    delete self->label_names;
+    self->label_names = new std::vector<std::string>();
+    if (self->label_map_path && self->label_map_path[0] != '\0') {
+        std::string error;
+        if (!load_label_map_file(self->label_map_path, self->label_names, &error)) {
+            GST_ERROR_OBJECT(self, "%s", error.c_str());
+            return FALSE;
+        }
+    } else {
+        *self->label_names = default_coco_labels();
+    }
+
     try {
         self->ort_env = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "ssv-infer");
         Ort::SessionOptions opts;
         opts.SetIntraOpNumThreads(1);
         opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+        const char *requested_device = self->device ? self->device : "auto";
+        if (!use_cpu_only(requested_device) && !use_cuda_requested(requested_device)) {
+            GST_ERROR_OBJECT(self, "unsupported inference device: %s", requested_device);
+            return FALSE;
+        }
+
+        bool cuda_enabled = false;
+        if (use_cuda_requested(requested_device)) {
+            try {
+                OrtCUDAProviderOptions cuda_options{};
+                cuda_options.device_id = self->cuda_device_id;
+                opts.AppendExecutionProvider_CUDA(cuda_options);
+                cuda_enabled = true;
+                GST_INFO_OBJECT(self,
+                    "ONNX Runtime provider requested=%s active=CUDAExecutionProvider device_id=%d",
+                    requested_device, self->cuda_device_id);
+            } catch (const Ort::Exception &e) {
+                if (self->cuda_required) {
+                    GST_ERROR_OBJECT(self,
+                        "CUDAExecutionProvider unavailable and required: %s", e.what());
+                    return FALSE;
+                }
+                GST_WARNING_OBJECT(self,
+                    "CUDAExecutionProvider unavailable, falling back to CPUExecutionProvider: %s",
+                    e.what());
+            }
+        }
+
+        if (!cuda_enabled) {
+            GST_INFO_OBJECT(self,
+                "ONNX Runtime provider requested=%s active=CPUExecutionProvider",
+                requested_device);
+        }
+
         self->ort_session = new Ort::Session(*self->ort_env, self->model_path, opts);
         self->mem_info = new Ort::MemoryInfo(
             Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault));
@@ -382,21 +566,40 @@ ssv_infer_start(GstBaseTransform *trans) {
         if (out_shape.size() == 3) {
             int dim1 = (int)out_shape[1];
             int dim2 = (int)out_shape[2];
-            if (dim1 < dim2) {
+            if (dim2 == 6) {
+                self->is_yolov8 = false;
+                self->is_yolo_nx6 = true;
+                self->num_classes = (int)self->label_names->size();
+                GST_INFO_OBJECT(self, "YOLO Nx6 model: %dx%d, %d labels, %d detections",
+                    self->model_w, self->model_h, self->num_classes, dim1);
+            } else if (dim1 < dim2) {
                 self->is_yolov8 = true;
+                self->is_yolo_nx6 = false;
                 self->num_classes = dim1 - 4;
                 GST_INFO_OBJECT(self, "YOLOv8 model: %dx%d, %d classes, %d anchors",
                     self->model_w, self->model_h, self->num_classes, dim2);
             } else {
                 self->is_yolov8 = false;
+                self->is_yolo_nx6 = false;
                 self->num_classes = dim2 - 5;
                 GST_INFO_OBJECT(self, "YOLOv5 model: %dx%d, %d classes, %d anchors",
                     self->model_w, self->model_h, self->num_classes, dim1);
             }
         }
 
-        GST_INFO_OBJECT(self, "model loaded: %s (input %dx%d)",
-            self->model_path, self->model_w, self->model_h);
+        if (!self->is_yolo_nx6 && (int)self->label_names->size() != self->num_classes) {
+            GST_ERROR_OBJECT(self, "label-map class count mismatch: model=%d labels=%zu",
+                self->num_classes, self->label_names->size());
+            return FALSE;
+        }
+        self->target_class_id = label_to_index(*self->label_names, self->target_class);
+        if (self->target_class_id == -2) {
+            GST_ERROR_OBJECT(self, "target-class not found in label-map: %s", self->target_class);
+            return FALSE;
+        }
+
+        GST_INFO_OBJECT(self, "model loaded: %s (input %dx%d, labels=%zu)",
+            self->model_path, self->model_w, self->model_h, self->label_names->size());
     } catch (const Ort::Exception &e) {
         GST_ERROR_OBJECT(self, "ONNX Runtime error: %s", e.what());
         return FALSE;
@@ -568,10 +771,14 @@ ssv_infer_transform_ip(GstBaseTransform *trans, GstBuffer *buf) {
 
     if (self->is_yolov8 && out_shape.size() == 3) {
         int n_anchors = (int)out_shape[2];
-        int target_cls_idx = target_class_to_index(self->target_class);
         parse_yolov8(out_data, n_anchors, self->num_classes,
                      self->model_w, self->model_h, src_w, src_h,
-                     self->conf_threshold, target_cls_idx, &det);
+                     self->conf_threshold, self->target_class_id, *self->label_names, &det);
+    } else if (self->is_yolo_nx6 && out_shape.size() == 3) {
+        int n_detections = (int)out_shape[1];
+        parse_yolo_nx6(out_data, n_detections,
+                       self->model_w, self->model_h, src_w, src_h,
+                       self->conf_threshold, self->target_class_id, *self->label_names, &det);
     }
 
     if (!det.detections.empty()) {
@@ -601,6 +808,20 @@ ssv_infer_set_property(GObject *object, guint prop_id,
         g_free(self->target_class);
         self->target_class = g_value_dup_string(value);
         break;
+    case PROP_LABEL_MAP:
+        g_free(self->label_map_path);
+        self->label_map_path = g_value_dup_string(value);
+        break;
+    case PROP_DEVICE:
+        g_free(self->device);
+        self->device = g_value_dup_string(value);
+        break;
+    case PROP_CUDA_DEVICE_ID:
+        self->cuda_device_id = g_value_get_int(value);
+        break;
+    case PROP_CUDA_REQUIRED:
+        self->cuda_required = g_value_get_boolean(value);
+        break;
     case PROP_MOCK_DETECT:
         self->mock_detect = g_value_get_boolean(value);
         break;
@@ -626,6 +847,18 @@ ssv_infer_get_property(GObject *object, guint prop_id,
     case PROP_TARGET_CLASS:
         g_value_set_string(value, self->target_class);
         break;
+    case PROP_LABEL_MAP:
+        g_value_set_string(value, self->label_map_path);
+        break;
+    case PROP_DEVICE:
+        g_value_set_string(value, self->device);
+        break;
+    case PROP_CUDA_DEVICE_ID:
+        g_value_set_int(value, self->cuda_device_id);
+        break;
+    case PROP_CUDA_REQUIRED:
+        g_value_set_boolean(value, self->cuda_required);
+        break;
     case PROP_MOCK_DETECT:
         g_value_set_boolean(value, self->mock_detect);
         break;
@@ -644,6 +877,9 @@ ssv_infer_finalize(GObject *object) {
     auto *self = SSV_INFER(object);
     g_free(self->model_path);
     g_free(self->target_class);
+    g_free(self->label_map_path);
+    g_free(self->device);
+    delete self->label_names;
     delete self->input_name;
     delete self->output_name;
     delete self->mem_info;
@@ -678,8 +914,29 @@ ssv_infer_class_init(SsvInferClass *klass) {
 
     g_object_class_install_property(gobject_class, PROP_TARGET_CLASS,
         g_param_spec_string("target-class", "Target Class",
-            "Only emit detections for this class (e.g. person)",
-            "person", (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+            "Only emit detections for this class (empty = all classes)",
+            "", (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+    g_object_class_install_property(gobject_class, PROP_LABEL_MAP,
+        g_param_spec_string("label-map", "Label Map",
+            "Path to model class label map file",
+            nullptr, (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+    g_object_class_install_property(gobject_class, PROP_DEVICE,
+        g_param_spec_string("device", "Inference Device",
+            "ONNX Runtime execution device: auto, cpu, or cuda",
+            "auto", (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+    g_object_class_install_property(gobject_class, PROP_CUDA_DEVICE_ID,
+        g_param_spec_int("cuda-device-id", "CUDA Device ID",
+            "CUDA device id used when CUDAExecutionProvider is enabled",
+            0, G_MAXINT, 0,
+            (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+    g_object_class_install_property(gobject_class, PROP_CUDA_REQUIRED,
+        g_param_spec_boolean("cuda-required", "CUDA Required",
+            "Fail startup when CUDAExecutionProvider cannot be enabled",
+            FALSE, (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
     g_object_class_install_property(gobject_class, PROP_MOCK_DETECT,
         g_param_spec_boolean("mock-detect", "Mock Detect",
@@ -710,7 +967,13 @@ static void
 ssv_infer_init(SsvInfer *self) {
     self->model_path = nullptr;
     self->conf_threshold = 0.5f;
-    self->target_class = g_strdup("person");
+    self->target_class = g_strdup("");
+    self->label_map_path = nullptr;
+    self->device = g_strdup("auto");
+    self->cuda_device_id = 0;
+    self->cuda_required = FALSE;
+    self->label_names = new std::vector<std::string>(default_coco_labels());
+    self->target_class_id = 0;
     self->ort_env = nullptr;
     self->ort_session = nullptr;
     self->mem_info = nullptr;
@@ -720,6 +983,7 @@ ssv_infer_init(SsvInfer *self) {
     self->model_w = 640;
     self->num_classes = 80;
     self->is_yolov8 = true;
+    self->is_yolo_nx6 = false;
     self->frame_id = 0;
     self->mock_detect = FALSE;
     self->async_infer = TRUE;

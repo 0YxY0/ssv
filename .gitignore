@@ -33,6 +33,8 @@ dist/
 # Output (future)
 output/
 evidence/
+artifacts/
+runs/
 
 # Models (too large for git)
 models/
