@@ -18,19 +18,25 @@ struct SsvConfig {
 
     // Display
     bool display_enabled = false;
+    bool display_overlay = false;
+    int display_fps = 30;
     std::string display_sink = "autovideosink";
 
     // Pipeline
+    std::string check_timeout = "30s";
     int analysis_fps = 5;
     int frame_width = 640;
     int frame_height = 480;
 
     // Inference
+    std::string runtime = "auto";
     std::string model_path;
     float confidence_threshold = 0.5f;
     std::string device = "auto";
-    int cuda_device_id = 0;
-    bool cuda_required = false;
+    int device_id = 0;
+    std::string precision = "auto";
+    std::string model_family = "yolo";
+    std::string output_format = "auto";
     std::string target_class = "person";
     std::string label_map = "config/model-labels/coco80.txt";
 
@@ -48,7 +54,7 @@ struct SsvConfig {
 };
 
 /// Load configuration from YAML file.
-/// Search order: explicit path → SSV_CONFIG_PATH env → config/ssv.default.yaml → /etc/ssv/ssv.yaml
+/// Search order: explicit path → SSV_CONFIG_PATH env → ssv.yaml → config/ssv.yaml → config/ssv.example.yaml → /etc/ssv/ssv.yaml
 /// Throws std::runtime_error if no config file found.
 SsvConfig ssv_config_load(const std::string& path = "");
 

@@ -22,20 +22,29 @@ class RedisConfig(BaseModel):
 
 class DisplayConfig(BaseModel):
     enabled: bool = False
+    overlay: bool = False
+    fps: int = 30
     sink: str = "autovideosink"
 
 
 class PipelineConfig(BaseModel):
+    check_timeout: str = "30s"
     analysis_fps: int = 5
     frame_width: int = 640
     frame_height: int = 480
 
 
 class InferenceConfig(BaseModel):
+    runtime: str = "auto"
     model_path: str = ""
     confidence_threshold: float = 0.5
-    device: str = "cpu"
+    device: str = "auto"
+    device_id: int = 0
+    precision: str = "auto"
+    model_family: str = "yolo"
+    output_format: str = "auto"
     target_class: str = "person"
+    label_map: str = "config/model-labels/coco80.txt"
 
 
 class TrackingConfig(BaseModel):
@@ -65,23 +74,18 @@ class SsvConfig(BaseModel):
 
 
 def _apply_env_overrides(cfg: SsvConfig) -> None:
-    """Override selected config fields from environment variables."""
+    """Override deployment-sensitive config fields from environment variables."""
     if v := os.environ.get("REDIS_HOST"):
         cfg.redis.host = v
     if v := os.environ.get("REDIS_PORT"):
         cfg.redis.port = int(v)
-    if v := os.environ.get("SSV_LOG_LEVEL"):
-        cfg.logging.python_log_level = v
-    if v := os.environ.get("SSV_DISPLAY_SINK"):
-        cfg.display.sink = v
 
 
 def load_config(path: str | Path | None = None) -> SsvConfig:
     """Load configuration from YAML file.
 
-    Search order: explicit path -> SSV_CONFIG_PATH env -> config/ssv.default.yaml -> defaults.
-    Environment variables (REDIS_HOST, REDIS_PORT, SSV_LOG_LEVEL, SSV_DISPLAY_SINK)
-    override corresponding YAML values.
+    Search order: explicit path -> SSV_CONFIG_PATH env -> ssv.yaml -> config/ssv.yaml -> config/ssv.example.yaml -> defaults.
+    Environment variables REDIS_HOST and REDIS_PORT override corresponding YAML values.
     """
     cfg: SsvConfig | None = None
 
@@ -102,7 +106,21 @@ def load_config(path: str | Path | None = None) -> SsvConfig:
             cfg = SsvConfig.model_validate(data)
 
     if cfg is None:
-        relative = Path("config/ssv.default.yaml")
+        local = Path("ssv.yaml")
+        if local.exists():
+            with open(local) as f:
+                data = yaml.safe_load(f) or {}
+            cfg = SsvConfig.model_validate(data)
+
+    if cfg is None:
+        config_local = Path("config/ssv.yaml")
+        if config_local.exists():
+            with open(config_local) as f:
+                data = yaml.safe_load(f) or {}
+            cfg = SsvConfig.model_validate(data)
+
+    if cfg is None:
+        relative = Path("config/ssv.example.yaml")
         if relative.exists():
             with open(relative) as f:
                 data = yaml.safe_load(f) or {}

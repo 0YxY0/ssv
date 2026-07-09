@@ -21,11 +21,14 @@ dist/
 
 # Environment
 .env
+ssv.yaml
+config/ssv.yaml
 
 # IDE
 .vscode/
 .idea/
 *.swp
+.codebase-memory/
 
 # OS
 .DS_Store
