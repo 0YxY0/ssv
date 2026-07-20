@@ -185,6 +185,73 @@ GST_START_TEST(test_ssvinfer_yolo_parser_parses_nx6_output) {
 }
 GST_END_TEST
 
+GST_START_TEST(test_ssvtrack_exposes_botsort_properties) {
+    GstElement *element = gst_element_factory_make("ssvtrack", nullptr);
+    fail_unless(element != nullptr);
+
+    gfloat match_thresh = 0.0f;
+    g_object_get(element, "match-thresh", &match_thresh, nullptr);
+    fail_unless(match_thresh == 0.8f);
+
+    fail_unless(g_object_class_find_property(G_OBJECT_GET_CLASS(element), "track-low-thresh") != nullptr);
+    fail_unless(g_object_class_find_property(G_OBJECT_GET_CLASS(element), "track-high-thresh") != nullptr);
+    fail_unless(g_object_class_find_property(G_OBJECT_GET_CLASS(element), "new-track-thresh") != nullptr);
+    fail_unless(g_object_class_find_property(G_OBJECT_GET_CLASS(element), "gmc-method") != nullptr);
+    fail_unless(g_object_class_find_property(G_OBJECT_GET_CLASS(element), "gmc-downscale") != nullptr);
+
+    gchar *gmc_method = nullptr;
+    g_object_get(element, "gmc-method", &gmc_method, nullptr);
+    fail_unless(gmc_method != nullptr);
+    fail_unless(std::string(gmc_method) == "sparse-opt-flow");
+    g_free(gmc_method);
+
+    g_object_set(element,
+        "frame-rate", 25,
+        "track-thresh", 0.55f,
+        "track-buffer", 45,
+        "match-thresh", 0.85f,
+        "track-low-thresh", 0.15f,
+        "track-high-thresh", 0.65f,
+        "new-track-thresh", 0.75f,
+        "gmc-method", "none",
+        "gmc-downscale", 3,
+        nullptr);
+
+    gint frame_rate = 0;
+    gfloat track_thresh = 0.0f;
+    gint track_buffer = 0;
+    gfloat configured_match_thresh = 0.0f;
+    gfloat track_low_thresh = 0.0f;
+    gfloat track_high_thresh = 0.0f;
+    gfloat new_track_thresh = 0.0f;
+    gint gmc_downscale = 0;
+    g_object_get(element,
+        "frame-rate", &frame_rate,
+        "track-thresh", &track_thresh,
+        "track-buffer", &track_buffer,
+        "match-thresh", &configured_match_thresh,
+        "track-low-thresh", &track_low_thresh,
+        "track-high-thresh", &track_high_thresh,
+        "new-track-thresh", &new_track_thresh,
+        "gmc-method", &gmc_method,
+        "gmc-downscale", &gmc_downscale,
+        nullptr);
+    fail_unless(frame_rate == 25);
+    fail_unless(fabsf(track_thresh - 0.55f) < 0.0001f);
+    fail_unless(track_buffer == 45);
+    fail_unless(fabsf(configured_match_thresh - 0.85f) < 0.0001f);
+    fail_unless(fabsf(track_low_thresh - 0.15f) < 0.0001f);
+    fail_unless(fabsf(track_high_thresh - 0.65f) < 0.0001f);
+    fail_unless(fabsf(new_track_thresh - 0.75f) < 0.0001f);
+    fail_unless(gmc_method != nullptr);
+    fail_unless(std::string(gmc_method) == "none");
+    fail_unless(gmc_downscale == 3);
+    g_free(gmc_method);
+
+    gst_object_unref(element);
+}
+GST_END_TEST
+
 GST_START_TEST(test_ssvoverlay_runs_on_rgb_buffer) {
     GstElement *pipeline = gst_parse_launch(
         "videotestsrc num-buffers=1 ! video/x-raw,format=RGB,width=64,height=48 ! "
@@ -292,6 +359,7 @@ static Suite *ssv_gst_suite() {
     tcase_add_test(tc, test_ssvinfer_exposes_runtime_properties);
     tcase_add_test(tc, test_ssvinfer_preprocessor_outputs_nchw_rgb_tensor);
     tcase_add_test(tc, test_ssvinfer_yolo_parser_parses_nx6_output);
+    tcase_add_test(tc, test_ssvtrack_exposes_botsort_properties);
     tcase_add_test(tc, test_ssvoverlay_runs_on_rgb_buffer);
     tcase_add_test(tc, test_ssvoverlay_runs_on_bgrx_buffer);
     tcase_add_test(tc, test_ssvoverlay_draws_latest_detection);

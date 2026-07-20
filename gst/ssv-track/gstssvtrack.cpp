@@ -1,4 +1,5 @@
 #include "gstssvtrack.hpp"
+#include "botsort/botsort_processor.hpp"
 #include "ssv_logging.hpp"
 #include "ssv_meta.hpp"
 
@@ -11,161 +12,6 @@
 
 GST_DEBUG_CATEGORY_STATIC(ssv_track_debug);
 
-// ── IoU Tracker (self-contained, no external deps) ────────────────────
-
-struct IoUTrack {
-    int id = 0;
-    float x1 = 0, y1 = 0, x2 = 0, y2 = 0;  // normalized [0,1]
-    int class_id = -1;
-    int age = 0;              // total matched frames
-    int time_since_seen = 0;  // frames since last match
-    float dx = 0, dy = 0;    // centroid velocity (for prediction)
-    bool alive = true;
-};
-
-static float
-compute_iou(float ax1, float ay1, float ax2, float ay2,
-            float bx1, float by1, float bx2, float by2)
-{
-    float ix1 = std::max(ax1, bx1);
-    float iy1 = std::max(ay1, by1);
-    float ix2 = std::min(ax2, bx2);
-    float iy2 = std::min(ay2, by2);
-
-    float iw = std::max(0.0f, ix2 - ix1);
-    float ih = std::max(0.0f, iy2 - iy1);
-    float inter = iw * ih;
-
-    float area_a = (ax2 - ax1) * (ay2 - ay1);
-    float area_b = (bx2 - bx1) * (by2 - by1);
-    float uni = area_a + area_b - inter;
-
-    return (uni > 0.0f) ? inter / uni : 0.0f;
-}
-
-static void
-centroid(float x1, float y1, float x2, float y2, float &cx, float &cy) {
-    cx = (x1 + x2) * 0.5f;
-    cy = (y1 + y2) * 0.5f;
-}
-
-class IoUTracker {
-public:
-    IoUTracker(int max_age, float iou_thresh, float conf_thresh)
-        : max_age_(max_age), iou_thresh_(iou_thresh), conf_thresh_(conf_thresh) {}
-
-    void update(std::vector<SsvDetection> &dets) {
-        // Predict positions using velocity
-        for (auto &t : tracks_) {
-            if (t.alive) {
-                float cx, cy;
-                centroid(t.x1, t.y1, t.x2, t.y2, cx, cy);
-                cx += t.dx;
-                cy += t.dy;
-                float w = (t.x2 - t.x1) * 0.5f;
-                float h = (t.y2 - t.y1) * 0.5f;
-                t.x1 = cx - w;
-                t.y1 = cy - h;
-                t.x2 = cx + w;
-                t.y2 = cy + h;
-            }
-        }
-
-        // Build IoU cost matrix and greedy-match by confidence (descending)
-        std::vector<int> det_order(dets.size());
-        for (size_t i = 0; i < dets.size(); ++i) det_order[i] = (int)i;
-        std::sort(det_order.begin(), det_order.end(), [&](int a, int b) {
-            return dets[a].confidence > dets[b].confidence;
-        });
-
-        std::vector<bool> track_matched(tracks_.size(), false);
-        std::vector<bool> det_matched(dets.size(), false);
-
-        for (int di : det_order) {
-            float best_iou = 0.0f;
-            int best_ti = -1;
-            for (size_t ti = 0; ti < tracks_.size(); ++ti) {
-                if (track_matched[ti] || !tracks_[ti].alive)
-                    continue;
-                if (tracks_[ti].class_id != dets[di].class_id &&
-                    tracks_[ti].class_id >= 0 && dets[di].class_id >= 0)
-                    continue;
-                float iou = compute_iou(
-                    tracks_[ti].x1, tracks_[ti].y1, tracks_[ti].x2, tracks_[ti].y2,
-                    dets[di].x1, dets[di].y1, dets[di].x2, dets[di].y2);
-                if (iou > best_iou) {
-                    best_iou = iou;
-                    best_ti = (int)ti;
-                }
-            }
-            if (best_ti >= 0 && best_iou >= iou_thresh_) {
-                auto &t = tracks_[best_ti];
-                // Compute velocity before updating bbox
-                float old_cx, old_cy, new_cx, new_cy;
-                centroid(t.x1, t.y1, t.x2, t.y2, old_cx, old_cy);
-                centroid(dets[di].x1, dets[di].y1, dets[di].x2, dets[di].y2, new_cx, new_cy);
-                t.dx = new_cx - old_cx;
-                t.dy = new_cy - old_cy;
-                t.x1 = dets[di].x1;
-                t.y1 = dets[di].y1;
-                t.x2 = dets[di].x2;
-                t.y2 = dets[di].y2;
-                t.age++;
-                t.time_since_seen = 0;
-                dets[di].track_id = t.id;
-                dets[di].track_state = (t.age == 1)
-                    ? SSV_TRACK_NEW : SSV_TRACK_MATCHED;
-                dets[di].occluded = (dets[di].confidence < conf_thresh_);
-                track_matched[best_ti] = true;
-                det_matched[di] = true;
-            }
-        }
-
-        // Unmatched tracks: increment time_since_seen
-        for (size_t ti = 0; ti < tracks_.size(); ++ti) {
-            if (!track_matched[ti] && tracks_[ti].alive) {
-                tracks_[ti].time_since_seen++;
-                if (tracks_[ti].time_since_seen > max_age_) {
-                    tracks_[ti].alive = false;
-                }
-            }
-        }
-
-        // Unmatched detections: create new tracks
-        for (size_t di = 0; di < dets.size(); ++di) {
-            if (!det_matched[di]) {
-                IoUTrack t;
-                t.id = next_id_++;
-                t.x1 = dets[di].x1;
-                t.y1 = dets[di].y1;
-                t.x2 = dets[di].x2;
-                t.y2 = dets[di].y2;
-                t.class_id = dets[di].class_id;
-                t.age = 1;
-                t.time_since_seen = 0;
-                t.alive = true;
-                dets[di].track_id = t.id;
-                dets[di].track_state = SSV_TRACK_NEW;
-                dets[di].occluded = false;
-                tracks_.push_back(t);
-            }
-        }
-
-        // Remove dead tracks
-        tracks_.erase(
-            std::remove_if(tracks_.begin(), tracks_.end(),
-                           [](const IoUTrack &t) { return !t.alive; }),
-            tracks_.end());
-    }
-
-private:
-    int next_id_ = 1;
-    int max_age_;
-    float iou_thresh_;
-    float conf_thresh_;
-    std::vector<IoUTrack> tracks_;
-};
-
 // ── GObject struct ─────────────────────────────────────────────────────
 struct _SsvTrack {
     GstBaseTransform parent;
@@ -175,10 +21,34 @@ struct _SsvTrack {
     gint track_buffer;
     gfloat match_thresh;
     gboolean mock_track;
+    gfloat track_low_thresh;
+    gfloat track_high_thresh;
+    gfloat new_track_thresh;
+    gchar *gmc_method;
+    gint gmc_downscale;
 
-    IoUTracker *tracker;
+    botsort::BoTSortProcessor *processor;
     gint mock_next_id;
 };
+
+static botsort::TrackerConfig
+make_botsort_config(const SsvTrack *self) {
+    botsort::TrackerConfig config;
+    config.frame_rate = self->frame_rate;
+    config.track_thresh = self->track_thresh;
+    config.track_buffer = self->track_buffer;
+    config.match_thresh = self->match_thresh;
+    config.track_low_thresh = self->track_low_thresh;
+    config.track_high_thresh = self->track_high_thresh;
+    config.new_track_thresh = self->new_track_thresh;
+    config.enable_score_fuse = true;
+    config.enable_class_constraint = false;
+    config.gmc_method = g_strcmp0(self->gmc_method, "none") == 0
+        ? botsort::GmcMethod::kNone
+        : botsort::GmcMethod::kSparseOptFlow;
+    config.gmc_downscale = self->gmc_downscale;
+    return config;
+}
 
 enum {
     PROP_0,
@@ -187,6 +57,11 @@ enum {
     PROP_TRACK_BUFFER,
     PROP_MATCH_THRESH,
     PROP_MOCK_TRACK,
+    PROP_TRACK_LOW_THRESH,
+    PROP_TRACK_HIGH_THRESH,
+    PROP_NEW_TRACK_THRESH,
+    PROP_GMC_METHOD,
+    PROP_GMC_DOWNSCALE,
 };
 
 G_DEFINE_TYPE(SsvTrack, ssv_track, GST_TYPE_BASE_TRANSFORM)
@@ -215,8 +90,9 @@ ssv_track_start(GstBaseTransform *trans) {
         self->mock_next_id = 1;
         GST_INFO_OBJECT(self, "mock-track enabled (sequential IDs)");
     } else {
-        self->tracker = new IoUTracker(self->track_buffer, self->match_thresh, self->track_thresh);
-        GST_INFO_OBJECT(self, "IoU tracker started (buffer=%d, match_thresh=%.2f, track_thresh=%.2f)",
+        const auto config = make_botsort_config(self);
+        self->processor = new botsort::BoTSortProcessor(config);
+        GST_INFO_OBJECT(self, "BoT-SORT tracker started (buffer=%d, match_thresh=%.2f, track_thresh=%.2f)",
             self->track_buffer, self->match_thresh, self->track_thresh);
     }
     return TRUE;
@@ -225,14 +101,13 @@ ssv_track_start(GstBaseTransform *trans) {
 static gboolean
 ssv_track_stop(GstBaseTransform *trans) {
     auto *self = SSV_TRACK(trans);
-    delete self->tracker;
-    self->tracker = nullptr;
+    delete self->processor;
+    self->processor = nullptr;
     return TRUE;
 }
 
 static GstFlowReturn
 ssv_track_transform_ip(GstBaseTransform *trans, GstBuffer *buf) {
-    (void)buf;
     auto *self = SSV_TRACK(trans);
 
     auto det = SsvDetectionStore::instance().take_for_tracking();
@@ -248,13 +123,40 @@ ssv_track_transform_ip(GstBaseTransform *trans, GstBuffer *buf) {
             d.track_state = SSV_TRACK_NEW;
             d.occluded = false;
         }
-    } else if (self->tracker) {
-        self->tracker->update(det.detections);
-    }
+    } else if (self->processor) {
+        GstVideoInfo info;
+        gst_video_info_init(&info);
+        GstCaps *caps = gst_pad_get_current_caps(trans->sinkpad);
+        const bool have_info = caps && gst_video_info_from_caps(&info, caps);
+        const int frame_width = have_info ? GST_VIDEO_INFO_WIDTH(&info) : 0;
+        const int frame_height = have_info ? GST_VIDEO_INFO_HEIGHT(&info) : 0;
 
-    if (!det.detections.empty()) {
-        GST_DEBUG_OBJECT(self, "frame %" G_GUINT64_FORMAT ": %zu tracked detections",
-            det.frame_id, det.detections.size());
+        const std::uint8_t *frame_data = nullptr;
+        std::size_t frame_stride = 0;
+        GstVideoFrame frame;
+        bool frame_mapped = false;
+        if (g_strcmp0(self->gmc_method, "none") != 0 && have_info &&
+            gst_video_frame_map(&frame, &info, buf, GST_MAP_READ)) {
+            frame_data = static_cast<const std::uint8_t *>(
+                GST_VIDEO_FRAME_PLANE_DATA(&frame, 0));
+            frame_stride = static_cast<std::size_t>(
+                GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0));
+            frame_mapped = true;
+        } else if (g_strcmp0(self->gmc_method, "none") != 0) {
+            GST_WARNING_OBJECT(self, "GMC frame unavailable, falling back to no-frame update");
+        }
+
+        self->processor->process(det.detections, frame_width, frame_height,
+                                 frame_data, frame_stride);
+
+        if (frame_mapped)
+            gst_video_frame_unmap(&frame);
+        if (caps)
+            gst_caps_unref(caps);
+        if (!det.detections.empty()) {
+            GST_DEBUG_OBJECT(self, "frame %" G_GUINT64_FORMAT ": %zu tracked detections",
+                det.frame_id, det.detections.size());
+        }
     }
 
     SsvDetectionStore::instance().set_tracked(std::move(det));
@@ -283,6 +185,22 @@ ssv_track_set_property(GObject *object, guint prop_id,
     case PROP_MOCK_TRACK:
         self->mock_track = g_value_get_boolean(value);
         break;
+    case PROP_TRACK_LOW_THRESH:
+        self->track_low_thresh = g_value_get_float(value);
+        break;
+    case PROP_TRACK_HIGH_THRESH:
+        self->track_high_thresh = g_value_get_float(value);
+        break;
+    case PROP_NEW_TRACK_THRESH:
+        self->new_track_thresh = g_value_get_float(value);
+        break;
+    case PROP_GMC_METHOD:
+        g_free(self->gmc_method);
+        self->gmc_method = g_value_dup_string(value);
+        break;
+    case PROP_GMC_DOWNSCALE:
+        self->gmc_downscale = g_value_get_int(value);
+        break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
     }
@@ -308,6 +226,21 @@ ssv_track_get_property(GObject *object, guint prop_id,
     case PROP_MOCK_TRACK:
         g_value_set_boolean(value, self->mock_track);
         break;
+    case PROP_TRACK_LOW_THRESH:
+        g_value_set_float(value, self->track_low_thresh);
+        break;
+    case PROP_TRACK_HIGH_THRESH:
+        g_value_set_float(value, self->track_high_thresh);
+        break;
+    case PROP_NEW_TRACK_THRESH:
+        g_value_set_float(value, self->new_track_thresh);
+        break;
+    case PROP_GMC_METHOD:
+        g_value_set_string(value, self->gmc_method);
+        break;
+    case PROP_GMC_DOWNSCALE:
+        g_value_set_int(value, self->gmc_downscale);
+        break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
     }
@@ -318,8 +251,10 @@ ssv_track_get_property(GObject *object, guint prop_id,
 static void
 ssv_track_finalize(GObject *object) {
     auto *self = SSV_TRACK(object);
-    delete self->tracker;
-    self->tracker = nullptr;
+    delete self->processor;
+    self->processor = nullptr;
+    g_free(self->gmc_method);
+    self->gmc_method = nullptr;
     G_OBJECT_CLASS(ssv_track_parent_class)->finalize(object);
 }
 
@@ -353,8 +288,8 @@ ssv_track_class_init(SsvTrackClass *klass) {
 
     g_object_class_install_property(gobject_class, PROP_MATCH_THRESH,
         g_param_spec_float("match-thresh", "Match Threshold",
-            "IoU matching threshold",
-            0.0f, 1.0f, 0.3f,
+            "BoT-SORT matching threshold",
+            0.0f, 1.0f, 0.8f,
             (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
     g_object_class_install_property(gobject_class, PROP_MOCK_TRACK,
@@ -362,10 +297,40 @@ ssv_track_class_init(SsvTrackClass *klass) {
             "Assign sequential IDs without real tracking",
             FALSE, (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
+    g_object_class_install_property(gobject_class, PROP_TRACK_LOW_THRESH,
+        g_param_spec_float("track-low-thresh", "Track Low Threshold",
+            "Low-confidence detection threshold used by BoT-SORT",
+            0.0f, 1.0f, 0.1f,
+            (GParamFlags)(G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY | G_PARAM_STATIC_STRINGS)));
+
+    g_object_class_install_property(gobject_class, PROP_TRACK_HIGH_THRESH,
+        g_param_spec_float("track-high-thresh", "Track High Threshold",
+            "High-confidence detection threshold used by BoT-SORT",
+            0.0f, 1.0f, 0.6f,
+            (GParamFlags)(G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY | G_PARAM_STATIC_STRINGS)));
+
+    g_object_class_install_property(gobject_class, PROP_NEW_TRACK_THRESH,
+        g_param_spec_float("new-track-thresh", "New Track Threshold",
+            "Minimum confidence required to spawn a new BoT-SORT track",
+            0.0f, 1.0f, 0.7f,
+            (GParamFlags)(G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY | G_PARAM_STATIC_STRINGS)));
+
+    g_object_class_install_property(gobject_class, PROP_GMC_METHOD,
+        g_param_spec_string("gmc-method", "GMC Method",
+            "Global motion compensation mode",
+            "sparse-opt-flow",
+            (GParamFlags)(G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY | G_PARAM_STATIC_STRINGS)));
+
+    g_object_class_install_property(gobject_class, PROP_GMC_DOWNSCALE,
+        g_param_spec_int("gmc-downscale", "GMC Downscale",
+            "Downscale factor used for GMC estimation",
+            1, 8, 2,
+            (GParamFlags)(G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY | G_PARAM_STATIC_STRINGS)));
+
     gst_element_class_set_static_metadata(element_class,
-        "SSV IoU Tracker",
+        "SSV BoT-SORT Tracker",
         "Filter/Effect/Video",
-        "Multi-object tracking using IoU-based matching",
+        "Multi-object tracking using BoT-SORT",
         "site-safety-vision");
 
     gst_element_class_add_static_pad_template(element_class, &sink_template);
@@ -382,9 +347,14 @@ ssv_track_init(SsvTrack *self) {
     self->frame_rate = 30;
     self->track_thresh = 0.5f;
     self->track_buffer = 30;
-    self->match_thresh = 0.3f;
+    self->match_thresh = 0.8f;
     self->mock_track = FALSE;
-    self->tracker = nullptr;
+    self->track_low_thresh = 0.1f;
+    self->track_high_thresh = 0.6f;
+    self->new_track_thresh = 0.7f;
+    self->gmc_method = g_strdup("sparse-opt-flow");
+    self->gmc_downscale = 2;
+    self->processor = nullptr;
     self->mock_next_id = 1;
 }
 
@@ -402,7 +372,7 @@ plugin_init(GstPlugin *plugin) {
 GST_PLUGIN_DEFINE(
     GST_VERSION_MAJOR, GST_VERSION_MINOR,
     ssvtrack,
-    "SSV IoU Tracker Plugin",
+    "SSV BoT-SORT Tracker Plugin",
     plugin_init,
     "0.1.0", "LGPL",
     "site-safety-vision",

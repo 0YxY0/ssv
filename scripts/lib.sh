@@ -37,6 +37,7 @@ elif [ "$SSV_ONNXRUNTIME_FLAVOR" != "cpu" ]; then
 fi
 SSV_ONNXRUNTIME_ROOT="${SSV_ONNXRUNTIME_ROOT:-$SSV_ONNXRUNTIME_DEFAULT_ROOT}"
 SSV_TENSORRT_ROOT="${SSV_TENSORRT_ROOT:-$SSV_ROOT/.deps/tensorrt}"
+SSV_OPENCV_ROOT="${SSV_OPENCV_ROOT:-$SSV_ROOT/.deps/opencv}"
 SSV_BUILD_DIR="${SSV_BUILD_DIR:-$SSV_ROOT/build}"
 SSV_PLUGIN_DIR="$SSV_BUILD_DIR/gst/ssv-template"
 
@@ -117,9 +118,11 @@ export_ssv_plugin_path() {
     export GST_PLUGIN_PATH="$SSV_PLUGIN_PATHS"
     # ssv-common 是共享库，需要让动态链接器能找到
     SSV_LD_PATHS="$SSV_BUILD_DIR/gst/ssv-common"
+    append_ld_path_if_dir "$SSV_OPENCV_ROOT"/usr/lib/*
     append_ld_path_if_dir "$SSV_ONNXRUNTIME_ROOT/lib"
     append_ld_path_if_dir "$SSV_TENSORRT_ROOT/usr/lib/x86_64-linux-gnu"
     append_ld_path_if_dir "$SSV_TENSORRT_ROOT/lib"
+    append_ld_path_if_dir "$SSV_TENSORRT_ROOT/TensorRT-11.1.0.106/lib"
     append_nvidia_wheel_libs
     export LD_LIBRARY_PATH="$SSV_LD_PATHS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 }
