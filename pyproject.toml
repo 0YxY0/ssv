@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ssv-cli"
 version = "0.1.0"
 description = "Site Safety Vision development CLI"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "PyYAML>=6.0",
     "redis>=5.0",

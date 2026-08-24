@@ -118,7 +118,7 @@ M8 端到端 demo 和交付收口
 
 现有实现基线：
 
-- `ssvinfer` 已具备 ONNX Runtime 加载、BGR 输入、letterbox、CHW、置信度过滤、类别过滤、NMS、`mock-detect` 和异步推理能力。
+- runner-owned `SsvInferenceService` 已具备原始 ONNX 输入契约校验、ONNX Runtime/TensorRT backend、模型尺寸 RGBA canvas、C++ float32 NCHW 预处理、letterbox 坐标变换、YOLOv5/YOLOv8/Nx6 输出解析、置信度过滤、类别过滤、NMS 和最新帧调度能力；`ssvinfer` 负责 GStreamer 适配和 metadata 发布。
 - `SsvDetection`、`SsvFrameDetections` 和检测结果写入 `SsvDetectionStore` 的基础结构已存在。
 - `./ssv run` 和 `./ssv test` 已具备真实模型 smoke 的环境依赖分支，运行参数统一来自 YAML 配置；本阶段不重复实现这些基础能力，只补齐说明、契约和验收。
 
@@ -131,7 +131,7 @@ M8 端到端 demo 和交付收口
 
 | 领取 | 领域 | 任务包 | 输出 | 验收 |
 | --- | --- | --- | --- | --- |
-| A | T2 | YOLO 推理链路梳理：基于现有 `ssvinfer` 分析 ONNX Runtime 加载、BGR 输入、letterbox、CHW、置信度过滤、类别过滤和 NMS | YOLO 推理链路说明，明确当前支持的输出格式和限制 | `./ssv build`、`meson test -C build` |
+| A | T2 | YOLO 推理链路梳理：基于 runner-owned inference service 分析原始 ONNX 输入契约、RGBA canvas 到 float32 NCHW 的预处理、YOLO 输出格式、置信度过滤、类别过滤和 NMS | YOLO 推理链路说明，明确当前支持的输出格式和限制 | `./ssv build`、`meson test -C build` |
 | B | T2 | 检测元数据契约：基于现有结构固化 `SsvDetection`、`SsvFrameDetections` 字段语义和坐标规则，补齐边界测试 | `ssv_meta` 检测字段契约，坐标统一为归一化坐标 | `gst/tests` 覆盖元数据基本行为和异常输入边界 |
 | C | T2 | 安全帽训练最小闭环：定义类别和 label map，用小规模数据集跑通 YOLO baseline 训练、ONNX 导出和单图推理 | 类别表、class_id 顺序、数据目录约定、训练命令、导出命令、ONNX 产物说明 | 不以准确率验收，至少完成数据到 ONNX 的闭环；如时间允许接入 `ssvinfer` smoke |
 | D | T1/T3/T5 | 工程验证与下游输入：整理 `./ssv run` 与 YAML 配置中的 mock/真实模型 smoke 参数，定义事件输入草案，形成 M1 验收清单 | mock/真实模型验证命令、YAML 运行参数清单、事件输入字段草案、测试矩阵增量 | mock smoke 和真实模型 smoke 的环境边界清楚；文档评审通过 |
@@ -139,7 +139,7 @@ M8 端到端 demo 和交付收口
 冻结接口：
 
 - `ssv_meta` 检测字段和坐标语义。
-- `ssvinfer` 基础插件属性：`model-path`、`conf-threshold`、`target-class`、`mock-detect`、`async`。
+- `ssvinfer` 适配器属性：`source-id`、`source-context`、`inference-service`、`mock-detect`；模型路径、runtime、输出格式、类别表和阈值由 YAML 的 `inference` 段管理。
 - 安全帽训练预研的 label map、类别顺序和 ONNX 导出约束。
 - T3 消费检测结果所需的最小字段。
 
@@ -147,7 +147,7 @@ M8 端到端 demo 和交付收口
 
 - 团队能说明当前 YOLO 模型输入、输出、后处理和限制。
 - mock 推理链路稳定通过自动测试。
-- 真实 `yolov8n.onnx` 链路有可复现命令，并明确依赖模型文件、视频源和显示环境。
+- 真实 `yolov8n.onnx` 原始模型链路有可复现命令，并明确依赖模型文件、预处理配置、视频源和显示环境。
 - 安全帽训练预研至少完成类别定义、数据目录约定、训练命令和 ONNX 导出命令。
 - 理想结果是自训练安全帽 ONNX 能跑一次单图推理或 `ssvinfer` smoke；如果未完成，必须记录阻塞原因和下一步。
 
@@ -434,7 +434,7 @@ M8 端到端 demo 和交付收口
 | 接口 | 冻结里程碑 | 负责 | 消费 | 说明 |
 | --- | --- | --- | --- | --- |
 | `ssv_meta` 检测字段和坐标语义 | M1 | T2 | T1、T3、T5 | 检测框统一使用归一化坐标 |
-| `ssvinfer` 基础插件属性 | M1 | T2 | T1、T5 | `model-path`、`conf-threshold`、`target-class`、`mock-detect`、`async` |
+| `ssvinfer` 适配器与推理配置 | M1 | T2 | T1、T5 | 插件使用 `source-id`、`source-context`、`inference-service`、`mock-detect`；模型和后处理使用 YAML `inference` 段 |
 | 安全帽训练产物契约 | M1 | T2 | T1、T3、T5 | label map、类别顺序、ONNX 导出约束和产物说明 |
 | 事件输入字段草案 | M1 | T3 | T4、T5 | 先冻结最小字段，M3 扩展为 Redis schema |
 | 跟踪字段和 track ID 语义 | M2 | T2 | T3、T5 | `track_id`、未跟踪默认值、跨帧稳定性预期 |
@@ -455,7 +455,7 @@ M8 端到端 demo 和交付收口
 | C++ 插件、元数据、Meson | `./ssv build` | 构建共享库、插件和测试 |
 | C++ 单元测试 | `meson test -C build` | 覆盖插件注册、元数据和 C++ 测试 |
 | Python Agent | `cd agent && uv run --extra dev pytest` | 覆盖 Agent 配置、消费和服务测试 |
-| CLI/依赖/模型服务 | `python3 -m unittest discover -s scripts/ssv_cli/tests -p 'test_*.py'` | 覆盖 `./ssv` CLI、依赖策略、模型服务和 Redis 管理入口 |
+| CLI/依赖/模型服务 | `uv run python -m unittest discover -s scripts/ssv_cli/tests -p 'test_*.py'` | 覆盖 `./ssv` CLI、依赖策略、模型服务和 Redis 管理入口 |
 | 综合测试入口 | `./ssv test` | 代码测试和链路 smoke 编排，部分项依赖 RTSP、模型和 Redis |
 | 本地显示链路 | `./ssv run --display` | 依赖视频源、模型、Redis 和显示环境 |
 
