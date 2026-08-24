@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -308,6 +309,59 @@ class RuntimeSnapshotTest(unittest.TestCase):
         with self.assertRaises(CliError) as raised:
             load_dependency_snapshot(ROOT / "does-not-exist" / "ssv-deps.env")
         self.assertIn("run ./ssv build first", str(raised.exception))
+
+
+class CliWrapperTest(unittest.TestCase):
+    def test_wrapper_runs_python_entrypoint_from_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            fake_bin = work / "bin"
+            fake_bin.mkdir()
+            record = work / "uv.json"
+            fake_uv = fake_bin / "uv"
+            fake_uv.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json\n"
+                "import os\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "Path(os.environ['SSV_TEST_RECORD']).write_text(\n"
+                "    json.dumps({'args': sys.argv[1:], 'cwd': os.getcwd()}),\n"
+                "    encoding='utf-8',\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            fake_uv.chmod(0o755)
+            environment = os.environ | {
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "SSV_TEST_RECORD": str(record),
+            }
+            result = subprocess.run(
+                [str(ROOT / "ssv"), "redis", "status", "--db", "4"],
+                cwd=work,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            captured = json.loads(record.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            captured["args"],
+            [
+                "run",
+                "--project",
+                str(ROOT),
+                "python",
+                str(ROOT / "ssv.py"),
+                "redis",
+                "status",
+                "--db",
+                "4",
+            ],
+        )
+        self.assertEqual(captured["cwd"], str(ROOT))
 
 
 class CommandHandoffTest(unittest.TestCase):

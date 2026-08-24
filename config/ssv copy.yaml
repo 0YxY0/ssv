@@ -1,0 +1,96 @@
+# Site Safety Vision - 运行时配置（v2.0）
+# 本文件是本地运行配置，已被 .gitignore 忽略；模板见 config/ssv.example.yaml。
+#
+# 环境变量覆盖（优先级高于 YAML）：
+#   REDIS_HOST   -> redis.host
+#   REDIS_PORT   -> redis.port
+#   SSV_RTSP_URL -> sources[0].uri
+#   GST_DEBUG    -> logging.cpp_debug_level
+
+version: "2.0"
+
+logging:
+  # GStreamer C++ 插件的 GST_DEBUG 模式。
+  cpp_debug_level: "ssv*:4"
+  # Python Agent 日志级别：DEBUG、INFO、WARNING 或 ERROR。
+  python_log_level: "INFO"
+
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+  stream_key: "ssv:events"
+  consumer_group: "ssv-agent"
+
+# 本阶段必须且只能配置一个 H.264 8-bit 视频源。
+sources:
+  - id: "camera-01"
+    uri: "rtsp://localhost:8554/test"
+    codec: "h264"
+    protocols: "tcp"
+    latency_ms: 200
+    decode:
+      # auto、vaapi、nvdec 或 software；显式模式不静默回退。
+      mode: "auto"
+      # auto、drm:/dev/dri/renderD<N> 或 cuda:<N>。
+      device: "auto"
+
+display:
+  enabled: true
+  # auto、gtkglsink 或 gtksink；显式 backend 不静默回退。
+  backend: "auto"
+  # drop-only 显示上限，不复制旧帧补足帧率。
+  fps: 30
+  # auto、x11 或 wayland。
+  gl_backend: "auto"
+  overlay:
+    enabled: true
+    font:
+      face: "regular"
+      size: 12
+    # 只影响 GTK 绘制，不回写 tracker、Redis、事件或证据。
+    motion_prediction:
+      enabled: true
+      max_horizon_ms: 300
+
+inference:
+  enabled: true
+  # drop-only 分析上限；0 表示不限流，但仍不允许积压。
+  analysis_fps: 25
+  model:
+    # 先运行 ./ssv prepare-model 生成 wrapper ONNX；正式链路不直接加载原始 float NCHW 模型。
+    path: "models/yolov8n.onnx"
+    family: "yolo"
+    output_format: "yolov8"
+    label_map: "config/model-labels/coco80.txt"
+  runtime:
+    type: "onnxruntime"
+    providers:
+      # auto 使用构建 profile 的默认 Provider 链；explicit 必须提供非空 order。
+      mode: "auto"
+    device_id: 0
+    precision: "auto"
+    # auto 或正整数。
+    cpu_threads: "auto"
+    cache:
+      enabled: true
+      # 空字符串表示使用 XDG/HOME 下的默认 ORT cache 目录。
+      directory: ""
+  confidence_threshold: 0.5
+  # 空字符串表示不过滤类别。
+  target_class: "person"
+
+tracking:
+  enabled: true
+  track_threshold: 0.5
+  track_buffer: 30
+  match_threshold: 0.3
+  mock_track: false
+  gmc:
+    # sparse-opt-flow 或 none；只有 sparse-opt-flow 使用 OpenCV。
+    method: "sparse-opt-flow"
+    downscale: 2
+
+agent:
+  state_machine_timeout: 300
+  max_retries: 3

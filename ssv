@@ -1,7 +1,12 @@
-#!/usr/bin/env python3
-"""Site Safety Vision project entry point."""
+#!/usr/bin/env bash
+set -euo pipefail
 
-from scripts.ssv_cli.cli import main
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+if ! command -v uv >/dev/null 2>&1; then
+    echo "[SSV] 错误: 需要 uv 执行项目 CLI；请先安装 uv" >&2
+    exit 127
+fi
+
+cd -- "$ROOT_DIR"
+exec uv run --project "$ROOT_DIR" python "$ROOT_DIR/ssv.py" "$@"
