@@ -170,17 +170,21 @@ Qdrant 只保存可重建的语义索引。embedding backend、model 或 schema 
 
 规则检索当前仍使用带来源的 mock backend，不能当作已经接入生产规则/SOP 知识库。
 
-## Redis 与运维
+## 运行时缓存与 Redis 运维
 
 ```bash
 uv run ./ssv redis start
-uv run ./ssv redis status
+uv run ./ssv cache status
+uv run ./ssv cache clear --dry-run
+uv run ./ssv cache clear
 docker exec ssv-redis redis-cli XLEN ssv:events
 docker exec ssv-redis redis-cli XRANGE ssv:events - + COUNT 5
 uv run ./ssv agent
 ```
 
-如果 YAML 修改了 `redis.stream_key`，把 Redis CLI 示例中的 `ssv:events` 换成相同 key。`uv run ./ssv redis clean --dry-run` 只统计 pending；`--stream --yes` 才会删除 stream 历史数据。
+如果 YAML 修改了 `redis.stream_key`，把 Redis CLI 示例中的 `ssv:events` 换成相同 key。`cache status` 显示该 Stream 的 entries、consumer group pending、Agent 去重 key 数量，以及 SQLite EventLedger 的事件和 durable job 数量；`cache clear` 默认同时清空该 Stream、`ssv:agent:dedup:*` 和 `SSV_EVENT_DB_PATH` 对应的 EventLedger 运行时表，`--dry-run` 只统计、不修改。清理前应停止 `./ssv run` 和 `./ssv agent`，否则新事件可能立即重新写入。清理不会影响 `agent/outputs`、Qdrant、DeerFlow checkpointer、其他 Redis key 或 Docker 容器。
+
+Redis 与 SQLite 分别执行，跨存储清理不是原子操作。若某一边失败，命令仍会尝试另一边并返回非零状态；根据输出停止服务后重试 `./ssv cache clear`。
 
 当 index job 因 embedding/Qdrant 故障进入 `dead` 或需要重建投影时，可在 `agent/` 下重新入队当前账本中的 index jobs：
 

@@ -49,67 +49,113 @@ def fake_redis_module(client: MagicMock) -> SimpleNamespace:
 
 
 class RedisAdminTest(unittest.TestCase):
-    def test_status_reads_stream_length_and_pending_summary(self) -> None:
-        redis = FakeRedis([42, [3, "1-0", "1-0", 1]])
+    def test_status_reads_stream_pending_and_dedup_key_counts(self) -> None:
+        redis = FakeRedis(
+            [
+                42,
+                [3, "1-0", "1-0", 1],
+                [
+                    "0",
+                    [
+                        "ssv:agent:dedup:camera-1:track-1",
+                        "ssv:agent:dedup:camera-1:track-2",
+                    ],
+                ],
+            ]
+        )
         admin = RedisAdmin(redis, stream_key="ssv:events", consumer_group="ssv-agent")
         status = admin.status()
         self.assertEqual(status.stream_length, 42)
         self.assertEqual(status.pending, 3)
-        self.assertEqual(
-            redis.commands,
-            [("XLEN", "ssv:events"), ("XPENDING", "ssv:events", "ssv-agent")],
-        )
-
-    def test_status_accepts_redis_py_pending_summary(self) -> None:
-        redis = FakeRedis([42, {"pending": 3, "min": "1-0", "max": "1-0", "consumers": []}])
-        admin = RedisAdmin(redis, stream_key="ssv:events", consumer_group="ssv-agent")
-        self.assertEqual(admin.status().pending, 3)
-
-    def test_clean_accepts_redis_py_pending_range_records(self) -> None:
-        redis = FakeRedis(
-            [
-                {"pending": 1, "min": "1-0", "max": "1-0", "consumers": []},
-                [
-                    {
-                        "message_id": "1-0",
-                        "consumer": "worker-a",
-                        "time_since_delivered": 100,
-                        "times_delivered": 1,
-                    }
-                ],
-                1,
-            ]
-        )
-        admin = RedisAdmin(redis, stream_key="ssv:events", consumer_group="ssv-agent")
-        result = admin.clean()
-        self.assertEqual(result.acknowledged, 1)
+        self.assertEqual(status.dedup_keys, 2)
         self.assertEqual(
             redis.commands,
             [
+                ("XLEN", "ssv:events"),
                 ("XPENDING", "ssv:events", "ssv-agent"),
-                ("XPENDING", "ssv:events", "ssv-agent", "-", "+", 500),
-                ("XACK", "ssv:events", "ssv-agent", "1-0"),
+                ("SCAN", "0", "MATCH", "ssv:agent:dedup:*", "COUNT", 500),
             ],
         )
 
-    def test_dry_run_does_not_ack_or_trim(self) -> None:
-        redis = FakeRedis([[2, "1-0", "1-0", 1]])
-        admin = RedisAdmin(redis, stream_key="ssv:events", consumer_group="ssv-agent")
-        result = admin.clean(include_stream=True, dry_run=True)
-        self.assertEqual(result.pending_before, 2)
-        self.assertEqual(result.acknowledged, 0)
-        self.assertEqual(result.trimmed, 0)
-        self.assertEqual(redis.commands, [("XPENDING", "ssv:events", "ssv-agent")])
-
-    def test_clean_acks_pending_in_batches_then_trims(self) -> None:
+    def test_status_accepts_redis_py_pending_summary(self) -> None:
         redis = FakeRedis(
             [
-                [3, "1-0", "1-0", 1],
-                [("1-0", "worker-a", 100, 1), ("1-1", "worker-a", 100, 1)],
-                2,
-                [("1-2", "worker-b", 100, 1)],
+                42,
+                {"pending": 3, "min": "1-0", "max": "1-0", "consumers": []},
+                ["0", []],
+            ]
+        )
+        admin = RedisAdmin(redis, stream_key="ssv:events", consumer_group="ssv-agent")
+        self.assertEqual(admin.status().pending, 3)
+
+    def test_status_treats_missing_consumer_group_as_empty(self) -> None:
+        redis = FakeRedis([0, RedisCommandError("NOGROUP No such key"), ["0", []]])
+        admin = RedisAdmin(redis, stream_key="ssv:events", consumer_group="ssv-agent")
+        status = admin.status()
+        self.assertEqual(status.pending, 0)
+        self.assertEqual(status.dedup_keys, 0)
+
+    def test_dedup_key_scan_continues_until_zero_cursor(self) -> None:
+        redis = FakeRedis(
+            [
+                ["7", ["ssv:agent:dedup:first"]],
+                ["0", [b"ssv:agent:dedup:second"]],
+            ]
+        )
+        admin = RedisAdmin(redis, stream_key="ssv:events", consumer_group="ssv-agent", batch_size=2)
+
+        self.assertEqual(admin.dedup_key_count(), 2)
+        self.assertEqual(
+            redis.commands,
+            [
+                ("SCAN", "0", "MATCH", "ssv:agent:dedup:*", "COUNT", 2),
+                ("SCAN", "7", "MATCH", "ssv:agent:dedup:*", "COUNT", 2),
+            ],
+        )
+
+    def test_dry_run_reports_runtime_cache_without_deleting(self) -> None:
+        redis = FakeRedis([42, [2, "1-0", "1-0", 1], ["0", ["ssv:agent:dedup:key"]]])
+        admin = RedisAdmin(redis, stream_key="ssv:events", consumer_group="ssv-agent")
+        result = admin.clear_runtime_cache(dry_run=True)
+        self.assertEqual(result.stream_entries_before, 42)
+        self.assertEqual(result.pending_before, 2)
+        self.assertEqual(result.dedup_keys_before, 1)
+        self.assertEqual(result.stream_deleted, 0)
+        self.assertEqual(result.dedup_deleted, 0)
+        self.assertTrue(result.dry_run)
+        self.assertEqual(
+            redis.commands,
+            [
+                ("XLEN", "ssv:events"),
+                ("XPENDING", "ssv:events", "ssv-agent"),
+                ("SCAN", "0", "MATCH", "ssv:agent:dedup:*", "COUNT", 500),
+            ],
+        )
+
+    def test_clear_runtime_cache_deletes_stream_and_dedup_keys_in_batches(self) -> None:
+        redis = FakeRedis(
+            [
+                5,
+                [3, "1-0", "1-2", 1],
+                [
+                    "0",
+                    [
+                        "ssv:agent:dedup:key-1",
+                        "ssv:agent:dedup:key-2",
+                        "ssv:agent:dedup:key-3",
+                    ],
+                ],
                 1,
-                3,
+                [
+                    "0",
+                    [
+                        "ssv:agent:dedup:key-1",
+                        "ssv:agent:dedup:key-2",
+                        "ssv:agent:dedup:key-3",
+                    ],
+                ],
+                2,
+                1,
             ]
         )
         admin = RedisAdmin(
@@ -118,44 +164,75 @@ class RedisAdminTest(unittest.TestCase):
             consumer_group="ssv-agent",
             batch_size=2,
         )
-        result = admin.clean(include_stream=True)
+        result = admin.clear_runtime_cache()
+        self.assertEqual(result.stream_entries_before, 5)
         self.assertEqual(result.pending_before, 3)
-        self.assertEqual(result.acknowledged, 3)
-        self.assertEqual(result.trimmed, 3)
+        self.assertEqual(result.dedup_keys_before, 3)
+        self.assertEqual(result.stream_deleted, 1)
+        self.assertEqual(result.dedup_deleted, 3)
         self.assertEqual(
             redis.commands,
             [
+                ("XLEN", "ssv:events"),
                 ("XPENDING", "ssv:events", "ssv-agent"),
-                ("XPENDING", "ssv:events", "ssv-agent", "-", "+", 2),
-                ("XACK", "ssv:events", "ssv-agent", "1-0", "1-1"),
-                ("XPENDING", "ssv:events", "ssv-agent", "(1-1", "+", 2),
-                ("XACK", "ssv:events", "ssv-agent", "1-2"),
-                ("XTRIM", "ssv:events", "MAXLEN", "=", 0),
+                ("SCAN", "0", "MATCH", "ssv:agent:dedup:*", "COUNT", 2),
+                ("DEL", "ssv:events"),
+                ("SCAN", "0", "MATCH", "ssv:agent:dedup:*", "COUNT", 2),
+                ("DEL", "ssv:agent:dedup:key-1", "ssv:agent:dedup:key-2"),
+                ("DEL", "ssv:agent:dedup:key-3"),
+            ],
+        )
+        self.assertNotIn(("DEL", "other:key"), redis.commands)
+        self.assertFalse(any("other:key" in command for command in redis.commands))
+
+    def test_empty_runtime_cache_reports_zero_deletions(self) -> None:
+        redis = FakeRedis([0, [0, "", "", 0], ["0", []], 0, ["0", []]])
+        admin = RedisAdmin(redis, stream_key="ssv:events", consumer_group="ssv-agent")
+        result = admin.clear_runtime_cache()
+        self.assertEqual(result.stream_deleted, 0)
+        self.assertEqual(result.dedup_deleted, 0)
+        self.assertEqual(
+            redis.commands[3:],
+            [
+                ("DEL", "ssv:events"),
+                ("SCAN", "0", "MATCH", "ssv:agent:dedup:*", "COUNT", 500),
             ],
         )
 
-    def test_empty_pending_skips_range_and_ack(self) -> None:
-        redis = FakeRedis([[0, "", "", 0]])
-        admin = RedisAdmin(redis, stream_key="ssv:events", consumer_group="ssv-agent")
-        result = admin.clean()
-        self.assertEqual(result.acknowledged, 0)
-        self.assertEqual(redis.commands, [("XPENDING", "ssv:events", "ssv-agent")])
-
-    def test_cleanup_error_keeps_completed_ack_statistics(self) -> None:
+    def test_cleanup_error_keeps_completed_delete_statistics(self) -> None:
         redis = FakeRedis(
             [
-                [2, "1-0", "1-1", 1],
-                [("1-0", "worker-a", 100, 1), ("1-1", "worker-a", 100, 1)],
                 2,
-                RedisCommandError("XTRIM failed"),
+                [2, "1-0", "1-1", 1],
+                [
+                    "0",
+                    [
+                        "ssv:agent:dedup:key-1",
+                        "ssv:agent:dedup:key-2",
+                        "ssv:agent:dedup:key-3",
+                    ],
+                ],
+                1,
+                [
+                    "0",
+                    [
+                        "ssv:agent:dedup:key-1",
+                        "ssv:agent:dedup:key-2",
+                        "ssv:agent:dedup:key-3",
+                    ],
+                ],
+                2,
+                RedisCommandError("DEL failed"),
             ]
         )
-        admin = RedisAdmin(redis, stream_key="ssv:events", consumer_group="ssv-agent")
+        admin = RedisAdmin(redis, stream_key="ssv:events", consumer_group="ssv-agent", batch_size=2)
         with self.assertRaises(RedisCleanupError) as raised:
-            admin.clean(include_stream=True)
+            admin.clear_runtime_cache()
+        self.assertEqual(raised.exception.result.stream_entries_before, 2)
         self.assertEqual(raised.exception.result.pending_before, 2)
-        self.assertEqual(raised.exception.result.acknowledged, 2)
-        self.assertEqual(raised.exception.result.trimmed, 0)
+        self.assertEqual(raised.exception.result.dedup_keys_before, 3)
+        self.assertEqual(raised.exception.result.stream_deleted, 1)
+        self.assertEqual(raised.exception.result.dedup_deleted, 2)
 
 
 class RedisConnectionTest(unittest.TestCase):

@@ -1,4 +1,4 @@
-"""Redis-py connection adapter and safe Redis Stream administration operations."""
+"""Redis-py adapter for SSV runtime-cache administration."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from typing import Any, Protocol, Self
 from ..config import RedisSettings
 
 RedisValue = Any
+AGENT_DEDUP_KEY_PATTERN = "ssv:agent:dedup:*"
 
 
 class RedisError(RuntimeError):
@@ -107,28 +108,35 @@ class RedisStatus:
     stream_length: int
     pending: int
     group: str
+    dedup_keys: int
 
 
 @dataclass(frozen=True)
 class RedisCleanupResult:
+    stream_entries_before: int
     pending_before: int
-    acknowledged: int
-    trimmed: int
+    dedup_keys_before: int
+    stream_deleted: int
+    dedup_deleted: int
     dry_run: bool
 
 
 @dataclass
 class _CleanupProgress:
+    stream_entries_before: int
     pending_before: int
-    acknowledged: int = 0
-    trimmed: int = 0
+    dedup_keys_before: int
+    stream_deleted: int = 0
+    dedup_deleted: int = 0
     dry_run: bool = False
 
     def result(self) -> RedisCleanupResult:
         return RedisCleanupResult(
+            stream_entries_before=self.stream_entries_before,
             pending_before=self.pending_before,
-            acknowledged=self.acknowledged,
-            trimmed=self.trimmed,
+            dedup_keys_before=self.dedup_keys_before,
+            stream_deleted=self.stream_deleted,
+            dedup_deleted=self.dedup_deleted,
             dry_run=self.dry_run,
         )
 
@@ -142,7 +150,7 @@ class RedisCleanupError(RedisError):
 
 
 class RedisAdmin:
-    """Operations scoped to one configured stream and consumer group."""
+    """Operations for one configured stream and the Agent dedup namespace."""
 
     def __init__(
         self,
@@ -166,7 +174,12 @@ class RedisAdmin:
         return _as_int(self._connection.execute("XLEN", self.stream_key), "stream length")
 
     def pending_total(self) -> int:
-        response = self._connection.execute("XPENDING", self.stream_key, self.consumer_group)
+        try:
+            response = self._connection.execute("XPENDING", self.stream_key, self.consumer_group)
+        except RedisCommandError as exc:
+            if "NOGROUP" in str(exc).upper():
+                return 0
+            raise
         if isinstance(response, dict):
             if "pending" not in response:
                 raise RedisError("unexpected XPENDING summary response")
@@ -175,91 +188,63 @@ class RedisAdmin:
             raise RedisError("unexpected XPENDING summary response")
         return _as_int(response[0], "pending total")
 
+    def _scan_keys(self, pattern: str) -> list[str]:
+        cursor = "0"
+        keys: list[str] = []
+        while True:
+            response = self._connection.execute(
+                "SCAN",
+                cursor,
+                "MATCH",
+                pattern,
+                "COUNT",
+                self.batch_size,
+            )
+            if not isinstance(response, (list, tuple)) or len(response) != 2:
+                raise RedisError("unexpected SCAN response")
+            cursor = _as_text(response[0])
+            raw_keys = response[1]
+            if raw_keys is None:
+                raw_keys = []
+            if not isinstance(raw_keys, (list, tuple)):
+                raise RedisError("unexpected SCAN key list")
+            keys.extend(_as_text(key) for key in raw_keys)
+            if cursor == "0":
+                return keys
+
+    def dedup_key_count(self) -> int:
+        return len(self._scan_keys(AGENT_DEDUP_KEY_PATTERN))
+
     def status(self) -> RedisStatus:
         return RedisStatus(
             stream_length=self.stream_length(),
             pending=self.pending_total(),
             group=self.consumer_group,
+            dedup_keys=self.dedup_key_count(),
         )
 
-    def _pending_rows(self, start: str, consumer: str | None = None) -> list[tuple[str, str]]:
-        args: list[str | int] = [
-            "XPENDING",
-            self.stream_key,
-            self.consumer_group,
-            start,
-            "+",
-            self.batch_size,
-        ]
-        if consumer:
-            args.append(consumer)
-        response = self._connection.execute(*args)
-        if response is None:
-            return []
-        if not isinstance(response, (list, tuple)):
-            raise RedisError("unexpected XPENDING range response")
-        rows: list[tuple[str, str]] = []
-        for row in response:
-            if isinstance(row, dict):
-                message_id = row.get("message_id")
-                consumer = row.get("consumer")
-                if message_id is None or consumer is None:
-                    raise RedisError("unexpected XPENDING row")
-                rows.append((_as_text(message_id), _as_text(consumer)))
-                continue
-            if not isinstance(row, (list, tuple)) or len(row) < 2:
-                raise RedisError("unexpected XPENDING row")
-            rows.append((_as_text(row[0]), _as_text(row[1])))
-        return rows
-
-    def clear_pending(
-        self,
-        *,
-        dry_run: bool = False,
-        pending_before: int | None = None,
-    ) -> int:
-        if pending_before is None:
-            pending_before = self.pending_total()
+    def clear_runtime_cache(self, *, dry_run: bool = False) -> RedisCleanupResult:
+        state = self.status()
         progress = _CleanupProgress(
-            pending_before=pending_before,
+            stream_entries_before=state.stream_length,
+            pending_before=state.pending,
+            dedup_keys_before=state.dedup_keys,
             dry_run=dry_run,
         )
-        self._clear_pending(progress)
-        return progress.acknowledged
-
-    def _clear_pending(self, progress: _CleanupProgress) -> None:
-        if progress.dry_run or progress.pending_before == 0:
-            return
-        start = "-"
-        while True:
-            rows = self._pending_rows(start)
-            if not rows:
-                break
-            ids = [row[0] for row in rows]
-            response = self._connection.execute("XACK", self.stream_key, self.consumer_group, *ids)
-            progress.acknowledged += _as_int(response, "acknowledged count")
-            if len(rows) < self.batch_size:
-                break
-            start = f"({rows[-1][0]}"
-
-    def trim_stream(self, *, dry_run: bool = False) -> int:
         if dry_run:
-            return 0
-        return _as_int(
-            self._connection.execute("XTRIM", self.stream_key, "MAXLEN", "=", 0),
-            "trimmed count",
-        )
-
-    def clean(self, *, include_stream: bool = False, dry_run: bool = False) -> RedisCleanupResult:
-        pending_before = self.pending_total()
-        progress = _CleanupProgress(
-            pending_before=pending_before,
-            dry_run=dry_run,
-        )
+            return progress.result()
         try:
-            self._clear_pending(progress)
-            if include_stream:
-                progress.trimmed = self.trim_stream(dry_run=dry_run)
+            progress.stream_deleted = _as_int(
+                self._connection.execute("DEL", self.stream_key),
+                "stream delete count",
+            )
+            dedup_keys = self._scan_keys(AGENT_DEDUP_KEY_PATTERN)
+            for start in range(0, len(dedup_keys), self.batch_size):
+                batch = dedup_keys[start : start + self.batch_size]
+                progress.dedup_deleted += _as_int(
+                    self._connection.execute("DEL", *batch),
+                    "dedup delete count",
+                )
         except RedisError as exc:
             raise RedisCleanupError(str(exc), result=progress.result()) from exc
         return progress.result()

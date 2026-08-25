@@ -6,7 +6,7 @@ import argparse
 import sys
 from collections.abc import Sequence
 
-from .commands import agent, build, clean, inspect, model, redis, run, test
+from .commands import agent, build, cache, clean, inspect, model, redis, run, test
 from .context import ProjectContext
 from .output import CliError, error
 
@@ -80,25 +80,28 @@ def build_parser() -> argparse.ArgumentParser:
     clean_parser = commands.add_parser("clean", help="删除 Meson 构建目录")
     clean_parser.set_defaults(handler=clean.run)
 
-    redis_parser = commands.add_parser("redis", help="启动、查看和清理 Redis")
+    redis_parser = commands.add_parser("redis", help="启动和停止 Docker Redis")
     _add_redis_options(redis_parser)
     redis_actions = redis_parser.add_subparsers(dest="redis_action", metavar="ACTION")
     redis_actions.required = True
     redis_start = redis_actions.add_parser("start", help="启动 Docker Redis")
     _add_redis_options(redis_start)
     redis_start.set_defaults(handler=redis.start)
-    redis_status = redis_actions.add_parser("status", help="查看 Redis stream/group 状态")
-    _add_redis_options(redis_status)
-    redis_status.set_defaults(handler=redis.status)
-    redis_clean = redis_actions.add_parser("clean", help="清理 pending 积压")
-    _add_redis_options(redis_clean)
-    redis_clean.add_argument("--stream", dest="include_stream", action="store_true", help="同时裁剪整个 stream")
-    redis_clean.add_argument("--dry-run", action="store_true", help="只统计，不修改 Redis")
-    redis_clean.add_argument("--yes", action="store_true", help="确认删除 stream 历史数据")
-    redis_clean.set_defaults(handler=redis.clean)
     redis_stop = redis_actions.add_parser("stop", help="停止 Docker Redis")
     _add_redis_options(redis_stop)
     redis_stop.set_defaults(handler=redis.stop)
+
+    cache_parser = commands.add_parser("cache", help="管理 SSV 运行时缓存")
+    _add_redis_options(cache_parser)
+    cache_actions = cache_parser.add_subparsers(dest="cache_action", metavar="ACTION")
+    cache_actions.required = True
+    cache_status = cache_actions.add_parser("status", help="查看 SSV 运行时缓存状态")
+    _add_redis_options(cache_status)
+    cache_status.set_defaults(handler=cache.status)
+    cache_clear = cache_actions.add_parser("clear", help="直接清空 SSV 运行时缓存")
+    _add_redis_options(cache_clear)
+    cache_clear.add_argument("--dry-run", action="store_true", help="只统计，不修改运行时记录")
+    cache_clear.set_defaults(handler=cache.clear)
 
     test_parser = commands.add_parser("test", help="运行代码测试和链路冒烟测试后退出")
     test_parser.set_defaults(handler=test.run)

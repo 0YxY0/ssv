@@ -109,13 +109,18 @@ Agent 是独立进程，需要时另开终端执行：
 | `./ssv run [RUNNER_ARGS]` | 启动 C++ 实时链路 |
 | `./ssv inspect` | 检查 GStreamer 插件是否注册 |
 | `./ssv test` | 编排 Python、C++、Agent 和契约测试 |
-| `./ssv redis start\|status\|clean\|stop` | 管理本地 Docker Redis |
+| `./ssv redis start\|stop` | 启动和停止本地 Docker Redis |
+| `./ssv cache status\|clear` | 查看和清空 SSV 运行时缓存 |
 | `./ssv agent [--config PATH]` | 启动 Python Agent |
 | `./ssv model export` | 导出示例 YOLOv8n 原始 ONNX |
 | `./ssv model manifest ...` | 从原始 ONNX 和 TensorRT engine 生成 schema v2 manifest |
 | `./ssv model verify ...` | 验证安全帽 `.pt` 模型 |
 
 `run` 的 `--display`、`--headless`、`--overlay` 和 `--display-backend` 参数只覆盖本次进程的显示设置，不会改写 YAML。
+
+`./ssv cache status` 查看当前配置 Stream 的 entries、consumer group pending、Agent 去重 key，以及 EventLedger SQLite 的事件和 durable job 数量。`./ssv cache clear` 直接清空 Redis Stream、`ssv:agent:dedup:*` 去重 key 和 EventLedger SQLite 运行时表；`--dry-run` 只统计、不删除。清理前应先停止 `./ssv run` 和 `./ssv agent`，否则新事件可能立即重新写入。该命令不会删除 `agent/outputs`、Qdrant、DeerFlow checkpointer、其他 Redis key 或 Docker 容器。
+
+Redis 与 SQLite 的清理分别执行，不提供跨存储原子事务。若命令返回失败，先根据输出确认两边已完成的范围，停止相关服务后重新执行 `./ssv cache clear`。
 
 ## 配置文件
 

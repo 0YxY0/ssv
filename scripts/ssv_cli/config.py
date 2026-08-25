@@ -28,6 +28,7 @@ class RedisSettings:
 @dataclass(frozen=True)
 class RuntimeConfig:
     redis: RedisSettings
+    event_db_path: Path
     source_path: Path | None = None
 
 
@@ -123,4 +124,13 @@ def load_runtime_config(
         stream_key=stream if stream is not None else settings.stream_key,
         consumer_group=group if group is not None else settings.consumer_group,
     )
-    return RuntimeConfig(redis=_validate_redis(settings), source_path=source_path)
+    event_db_value = environment.get("SSV_EVENT_DB_PATH") or "data/events.db"
+    event_db_path = Path(event_db_value).expanduser()
+    if not event_db_path.is_absolute():
+        event_db_path = context.root / "agent" / event_db_path
+
+    return RuntimeConfig(
+        redis=_validate_redis(settings),
+        event_db_path=event_db_path,
+        source_path=source_path,
+    )
